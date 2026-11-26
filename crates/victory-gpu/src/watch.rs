@@ -30,7 +30,7 @@
 //! ([`light`]).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -583,7 +583,7 @@ fn failed_asking(start: usize, end: usize) {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
     let (protected, clean, absent, viewed, aliased) = {
-        let g = guards();
+        let g = guards_read();
         let b = start / BLOCK;
         (g.protected.contains(&b), g.clean.contains(&b), g.absent.contains(&b), g.viewed.contains(&b), g.aliased.contains(&b))
     };
@@ -660,7 +660,7 @@ fn known_view(start: usize) -> bool {
     if light() && PUBLISHED.all(first, first + 1) {
         return true;
     }
-    let g = guards();
+    let g = guards_read();
     g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
 }
 
@@ -739,7 +739,17 @@ fn view_known() -> bool {
     }
 }
 
-static GUARDS: Mutex<Guards> = Mutex::new(Guards {
+/// `VICTORY_PORT_GUARD`: 1 (only) lets the read-only lookups of the guards
+/// ([`guards_read`]) share a read lock, so the read-heavy asks of host
+/// copies do not block on the exclusive lock the title's write faults and
+/// our own writes take. Unset or `0` (the default) keeps every look
+/// exclusive, as before.
+fn port_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_GUARD").is_some_and(|v| v == "1"))
+}
+
+static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
@@ -751,8 +761,25 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     disturbed: BTreeSet::new(),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    waited(&GUARDS, 0)
+/// The guards' lock, alone: every mutation of the guards and every look
+/// that goes on to act on what it read takes it ([`guard_at`], [`open`],
+/// [`title_memory_written`], the write-fault handler). The same exclusive
+/// lock the `Mutex` gave, whatever `VICTORY_PORT_GUARD` says; the wait is
+/// timed as the `Mutex`'s was ([`WAITS`]).
+fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
+    match GUARDS.try_write() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let started = std::time::Instant::now();
+            let held = GUARDS.write().unwrap_or_else(|e| e.into_inner());
+            let us = started.elapsed().as_micros() as u64;
+            WAITS[0][0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            WAITS[0][1].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+            WAITED.with(|w| w[0].set(w[0].get() + us));
+            held
+        }
+    }
 }
 
 fn journal() -> std::sync::MutexGuard<'static, Journal> {
@@ -796,10 +823,58 @@ fn waited<T>(lock: &'static Mutex<T>, which: usize) -> std::sync::MutexGuard<'st
     }
 }
 
+/// A read-only look at the guards ([`known_view`], [`clean`],
+/// [`unchanged_known`], the first look of [`look_at_holes`], the known
+/// check of [`guard_at`], diagnostics): a read lock with
+/// `VICTORY_PORT_GUARD=1`, the exclusive lock without it (as every look
+/// did before). The lock is let go at the end of the look; nothing acts
+/// on what it read under it.
+fn guards_read() -> GuardsRead<'static> {
+    if port_guard() {
+        GuardsRead::Read(waited_read())
+    } else {
+        GuardsRead::Write(guards())
+    }
+}
+
+/// [`guards_read`]' read lock, with the wait timed as the exclusive
+/// lock's is ([`WAITS`], the guards' column).
+fn waited_read() -> std::sync::RwLockReadGuard<'static, Guards> {
+    match GUARDS.try_read() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let started = std::time::Instant::now();
+            let held = GUARDS.read().unwrap_or_else(|e| e.into_inner());
+            let us = started.elapsed().as_micros() as u64;
+            WAITS[0][0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            WAITS[0][1].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+            WAITED.with(|w| w[0].set(w[0].get() + us));
+            held
+        }
+    }
+}
+
+/// What [`guards_read`] returns: a shared or an exclusive guard.
+enum GuardsRead<'a> {
+    Read(std::sync::RwLockReadGuard<'a, Guards>),
+    Write(std::sync::RwLockWriteGuard<'a, Guards>),
+}
+
+impl std::ops::Deref for GuardsRead<'_> {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        match self {
+            GuardsRead::Read(g) => g,
+            GuardsRead::Write(g) => g,
+        }
+    }
+}
+
 /// Whether the block `page` is read-only by our hand and unwritten since a
 /// copy took it (diagnostics of `VICTORY_BACK_OWN_CHECK`).
 pub(crate) fn clean(page: usize) -> bool {
-    guards().clean.contains(&page)
+    guards_read().clean.contains(&page)
 }
 
 /// `VICTORY_LIGHT_REFRESH`: 0 off, 1 on, 2 in turn ([`light`]).
@@ -1147,7 +1222,7 @@ fn look_at_holes(most: usize) {
         return;
     };
     let part: Vec<usize> = {
-        let g = guards();
+        let g = guards_read();
         if g.holes.is_empty() {
             return;
         }
@@ -1268,7 +1343,7 @@ pub(crate) fn unchanged_known(start: usize, end: usize, base: usize, copied: &[u
     }
     // (The journal's lock is let go first: `writes_as` takes it, then the
     // guards'.)
-    let g = guards();
+    let g = guards_read();
     let blocks = last - first;
     g.protected.range(first..last).count() == blocks && g.clean.range(first..last).count() == blocks
 }
@@ -1426,7 +1501,7 @@ fn guard_at_later(
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
+        let g = guards_read();
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
     };
@@ -1441,7 +1516,12 @@ fn guard_at_later(
     // and taken for unwritten, a write that lands before their guard
     // stands would be in nobody's copy; so the asking waits for that one.
     while g.arming.range(first..last).next().is_some() {
-        g = ARMED.wait(g).unwrap_or_else(|e| e.into_inner());
+        // (A `Condvar` waits on a `MutexGuard`; the guards' lock is an
+        // `RwLock` now: sleep a moment and look again under the lock —
+        // no wakeup can be missed, and the arming is short.)
+        drop(g);
+        std::thread::park_timeout(std::time::Duration::from_micros(100));
+        g = guards();
     }
     let _held = Held::new();
     let mut arming = Arming(Vec::new());
@@ -1530,10 +1610,6 @@ fn guard_at_later(
 pub(crate) static GUARD_OUTSIDE_TEST: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
-/// Signalled, under the guards' lock, when an asking's blocks are made
-/// read-only ([`Arming::finish`]).
-static ARMED: std::sync::Condvar = std::sync::Condvar::new();
-
 /// Runs of blocks `[from, to)` an asking noted read-only and clean, and
 /// in `Guards::arming`, whose protection it has yet to change
 /// ([`guard_outside`]).
@@ -1621,7 +1697,6 @@ impl Arming {
             }
         }
         drop(held);
-        ARMED.notify_all();
         if !bits {
             return;
         }
@@ -1629,7 +1704,7 @@ impl Arming {
         // asking waiting for these blocks holds it, so not before they
         // are out of `arming`), then the guards'.
         let j = journal();
-        let g = guards();
+        let g = guards_read();
         for &(from, to) in &runs {
             for block in from..to {
                 if g.clean.contains(&block) && !g.arming.contains(&block) {
