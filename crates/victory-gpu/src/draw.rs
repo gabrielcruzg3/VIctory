@@ -1596,13 +1596,23 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        let mut slots = if *passes % 16 == 0 {
             ranges.clear();
             host.buffer_slots()
         } else {
             changed
         };
         *passes += 1;
+        // Skip buffer slots read through a draw's table: the draw brings them
+        // up to date itself (same as textures in `tabled_lately`).
+        slots.retain(|&index| {
+            if host.tabled_lately(index, frame) {
+                ranges.remove(&index);
+                false
+            } else {
+                true
+            }
+        });
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1617,12 +1627,8 @@ impl State {
                 ranges.remove(&index);
                 continue;
             };
-            // Whether making the view just resolved the copy the slot reads
-            // (`buffer_copy`): the slot then shows that copy, as it was put
-            // in `kept` with it.
             #[cfg(feature = "diagnostics")]
             let made = resolved.is_some();
-            // Every 64 views while the device lives (a cheap query).
             if alive
                 && n % 64 == 63
                 && let Some(why) = crate::descriptor::host::device_removed()
@@ -1637,9 +1643,6 @@ impl State {
                 tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
                 crate::host::log_removal_context();
             }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find: the one making the view just
-            // resolved, when it did, and only otherwise looked up again.
             let (shadow, address, len) = match resolved {
                 Some(copy) => copy,
                 None => match crate::descriptor::host::buffer_copy(&view) {
@@ -1654,14 +1657,8 @@ impl State {
             if !made && host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            // The entry is mostly the one the last look left (the pass
-            // takes every buffer slot every 16 frames and the writes since
-            // between): written in place, not taken out and put back.
             if let Some(entry) = ranges.get_mut(&index) {
-                if !(std::sync::Arc::ptr_eq(&entry.0, &shadow)
-                    && entry.1 == address
-                    && entry.2 == address + len)
-                {
+                if !(std::sync::Arc::ptr_eq(&entry.0, &shadow) && entry.1 == address && entry.2 == address + len) {
                     *entry = (shadow, address, address + len);
                 }
             } else {

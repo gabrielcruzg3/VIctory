@@ -1551,7 +1551,7 @@ impl HostHeap {
     /// Whether title slot `index` was a table's within the last
     /// [`TABLED_FRAMES`] frames before `frame` (never, if such slots are
     /// to be queued as any other).
-    fn tabled_lately(&self, index: u32, frame: u64) -> bool {
+    pub(crate) fn tabled_lately(&self, index: u32, frame: u64) -> bool {
         let stamp = self.tabled_stamp(index) & !TABLED_READ;
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         tabled_out() && stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES

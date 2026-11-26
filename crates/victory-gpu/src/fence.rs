@@ -103,11 +103,37 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         #[cfg(windows)]
         if crate::host::late() {
             drop(waiters);
+            crate::queue::before_sync();
             crate::host::settle_for_fence();
             if fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
             }
-            tracing::warn!(value, "blocking fence wait not implemented");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            loop {
+                let current = fence.value.load(Ordering::Acquire);
+                if current >= value {
+                    return S_OK;
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let ms = (deadline - now).as_millis().min(10) as u32;
+                // SAFETY: wait on the atomic u64 until woken by WakeByAddressAll or timeout.
+                unsafe {
+                    windows_sys::Win32::System::Threading::WaitOnAddress(
+                        (&raw const fence.value).cast(),
+                        (&raw const current).cast(),
+                        size_of::<u64>(),
+                        ms.max(1),
+                    );
+                }
+                crate::queue::release_held(false);
+            }
+            if fence.value.load(Ordering::Acquire) >= value {
+                return S_OK;
+            }
+            tracing::warn!(value, "blocking fence wait timed out");
             return E_NOTIMPL;
         }
         // shortcut: a null event means "block until reached"; nothing can
@@ -118,26 +144,11 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     waiters.push((value, event as usize));
     S_OK
 }
-/// Whether a fence that moves wakes the threads asleep on its value (`VICTORY_MWAITX_SLEEP=1`,
-/// the same switch as the loader's `console_insn::sleeps`): the title waits for a fence by
-/// reading its value in memory with `monitorx` / `mwaitx`, which on an Intel processor the
-/// loader turns into a sleep on that address once the wait has spun a while.
-#[cfg(windows)]
-fn wakes() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MWAITX_SLEEP").is_some_and(|v| v == "1"))
-}
-
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    #[cfg(windows)]
-    if wakes() {
-        // SAFETY: the address of the fence's own value, alive while the fence is.
-        unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const fence.value).cast()) };
-    }
     #[cfg(all(windows, feature = "diagnostics"))]
     pace::reached(this, &fence.asked, value);
     waiters.retain(|&(wanted, event)| {
@@ -147,6 +158,12 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
+    drop(waiters);
+    #[cfg(windows)]
+    // SAFETY: the address of the fence's own value, alive while the fence is.
+    unsafe {
+        windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const fence.value).cast());
+    }
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     set(this, value);

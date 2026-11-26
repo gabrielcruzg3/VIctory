@@ -519,6 +519,90 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
 });
+
+/// Current live generation per table entry (0 when free or forgotten),
+/// updated under `VIEWS`'s write lock so readers can validate their
+/// thread-local cache without touching `VIEWS` (Marvisak/VIctory #3275).
+const LIVE_CHUNK: usize = 4096;
+const LIVE_CHUNKS: usize = 1024;
+static LIVE: [std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicU32>; LIVE_CHUNKS] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; LIVE_CHUNKS];
+
+fn live_slot(i: u32) -> Option<&'static std::sync::atomic::AtomicU32> {
+    let chunk = i as usize / LIVE_CHUNK;
+    let offset = i as usize % LIVE_CHUNK;
+    let ptr = LIVE.get(chunk)?.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: chunks are leaked static allocations of `LIVE_CHUNK` elements.
+    Some(unsafe { &*ptr.add(offset) })
+}
+
+fn live(i: u32) -> Option<u32> {
+    live_slot(i).map(|slot| slot.load(std::sync::atomic::Ordering::Acquire))
+}
+
+/// Records entry `i`'s live generation (0 when released). Called only under
+/// `VIEWS` write lock.
+fn set_live(i: u32, generation: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let chunk = i as usize / LIVE_CHUNK;
+    let offset = i as usize % LIVE_CHUNK;
+    let Some(entry) = LIVE.get(chunk) else {
+        return;
+    };
+    let mut ptr = entry.load(Ordering::Relaxed);
+    if ptr.is_null() {
+        let alloc: Box<[AtomicU32; LIVE_CHUNK]> = Box::new([const { AtomicU32::new(0) }; LIVE_CHUNK]);
+        ptr = Box::into_raw(alloc).cast::<AtomicU32>();
+        entry.store(ptr, Ordering::Release);
+    }
+    // SAFETY: `offset < LIVE_CHUNK` and `ptr` points to a leaked `LIVE_CHUNK` array.
+    unsafe { &*ptr.add(offset) }.store(generation, Ordering::Release);
+}
+
+const SEEN_SLOTS: usize = 2048;
+thread_local! {
+    static SEEN: std::cell::RefCell<Vec<Option<(u32, u32, View)>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn view_of(i: u32, generation: u32) -> Option<View> {
+    if generation == 0 {
+        return None;
+    }
+    let slot = (i as usize) & (SEEN_SLOTS - 1);
+    if live(i) == Some(generation)
+        && let Ok(Some(cached)) = SEEN.try_with(|s| {
+            s.borrow()
+                .get(slot)
+                .and_then(|e| e.as_ref())
+                .filter(|(si, sg, _)| *si == i && *sg == generation)
+                .map(|(_, _, v)| v.clone())
+        })
+    {
+        return Some(cached);
+    }
+    let view = {
+        let views = views_read();
+        let (view, current) = views.list.get(i as usize)?;
+        if *current != generation {
+            return None;
+        }
+        view.clone()
+    };
+    if live(i) == Some(generation) {
+        let _ = SEEN.try_with(|s| {
+            let mut s = s.borrow_mut();
+            if s.is_empty() {
+                s.resize(SEEN_SLOTS, None);
+            }
+            s[slot] = Some((i, generation, view.clone()));
+        });
+    }
+    Some(view)
+}
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
@@ -664,6 +748,7 @@ impl Views {
                     self.by_resource.entry(r).or_default().push(i);
                 }
                 self.index.insert(view, i);
+                set_live(i, self.list[i as usize].1);
                 i
             }
         };
@@ -889,6 +974,7 @@ pub(crate) fn forget(resource: usize) {
         views.index.remove(&view);
         // (Below the bits that say a record is no table entry.)
         views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        set_live(i, 0);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
@@ -899,11 +985,7 @@ pub(crate) fn forget(resource: usize) {
 /// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
-        0 => {
-            let views = views_read();
-            let (view, current) = views.list.get(i as usize)?;
-            (*current == generation).then(|| view.clone())
-        }
+        0 => view_of(i, generation),
         CONSTANT => Some(constant_of(i, generation)),
         PLACED => views_read().placed_of(i, generation),
         _ => None,
@@ -1432,6 +1514,53 @@ mod tests {
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    /// A thread that looked views up (as title threads recording draws do)
+    /// finds the slot's new view once the title rewrites it, and none for a
+    /// released resource's view, also when its entry holds another view
+    /// since.
+    #[test]
+    fn threads_that_looked_views_up_see_them_rewritten_and_released() {
+        let null = std::ptr::null();
+        let slots = [0u64; 4 * 4];
+        let a = slots.as_ptr() as u64;
+        let (b, c) = (a + 32, a + 64);
+        let (first, second, third) = (0x7778_0000usize, 0x7779_0000usize, 0x777a_0000usize);
+        let (ask, asked) = std::sync::mpsc::channel::<u64>();
+        let (answer, answers) = std::sync::mpsc::channel::<Option<View>>();
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                for at in asked {
+                    answer.send(view(at)).unwrap();
+                }
+            });
+            let look = |at: u64| {
+                ask.send(at).unwrap();
+                answers.recv().unwrap()
+            };
+            create_srv(null, first as This, std::ptr::null(), a);
+            assert_eq!(look(a), Some(View::Shader(first, None)));
+            assert_eq!(look(a), Some(View::Shader(first, None)), "looked up again");
+            create_srv(null, second as This, std::ptr::null(), a);
+            assert_eq!(look(a), Some(View::Shader(second, None)), "rewritten");
+            create_srv(null, first as This, std::ptr::null(), b);
+            assert_eq!(look(b), Some(View::Shader(first, None)));
+            // SAFETY: in `slots`.
+            let [_, entry, _] = unsafe { *(b as *const [u32; 3]) };
+            forget(first);
+            assert_eq!(look(b), None, "released");
+            create_srv(null, third as This, std::ptr::null(), c);
+            // SAFETY: in `slots`.
+            let [_, reused, _] = unsafe { *(c as *const [u32; 3]) };
+            assert_eq!(look(c), Some(View::Shader(third, None)));
+            let again = if entry == reused { "reused" } else { "free" };
+            assert_eq!(look(b), None, "released, its entry {again}");
+            assert_eq!(view(b), None);
+            drop(ask);
+        });
+        forget(second);
+        forget(third);
     }
 
     /// The title places its shader-visible heap in its own memory
