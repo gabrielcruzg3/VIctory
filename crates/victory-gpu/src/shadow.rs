@@ -4371,7 +4371,7 @@ pub(crate) fn find_or_exact(
     len: u64,
     range: impl Fn(u64) -> Option<(u64, u64)>,
 ) -> Option<(Arc<Shadow>, bool)> {
-    if crate::inplace::level() != 0 {
+    if crate::inplace::level() != 0 || crate::port::on() {
         // A placed buffer can add a bias to its offset after opening the
         // heap. Use the actual backing when in-place placement is enabled.
         let shadow = find(address, len)?;
@@ -4434,6 +4434,12 @@ fn lookup(
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && size >= card_limits().0;
+        // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
+        // title's 32-bit graphics heap in place, big or not.
+        if let Some(placed) = crate::port::place_for(key.0, len, false) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false, false)));
+            return entry.shadow.clone().map(|shadow| (shadow, false));
+        }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false, false)));
             return entry.shadow.clone().map(|shadow| (shadow, false));
@@ -4707,7 +4713,7 @@ fn loose(
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::inplace::place_for(start, len, true) {
+    if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true, false));
         note(&shadow);
         map.insert((start, len), shadow.clone());

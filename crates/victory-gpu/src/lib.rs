@@ -59,6 +59,8 @@ mod pixels;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod port;
 pub mod list;
 pub mod object;
 pub mod pipeline;

@@ -477,8 +477,10 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     let started = std::time::Instant::now();
     // View memory the guards already hold cannot be write-watched: the
     // kernel asking would only fail. Copies of it are flushed many times a
-    // frame, each time paying that failed call before the guards answer.
-    let known_view = guarded && known_view(first * PAGE);
+    // frame, each time paying that failed call before the guards answer
+    // (skip for both guarded buffer refreshes and unguarded texture refreshes,
+    // renderer port #6 `65f9707`).
+    let known_view = known_view(first * PAGE);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known_view
         || unsafe {
