@@ -30,7 +30,7 @@
 //! ([`light`]).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -559,7 +559,7 @@ fn failed_asking(start: usize, end: usize) {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
     let (protected, clean, absent, viewed, aliased) = {
-        let g = guards();
+        let g = guards_read();
         let b = start / BLOCK;
         (g.protected.contains(&b), g.clean.contains(&b), g.absent.contains(&b), g.viewed.contains(&b), g.aliased.contains(&b))
     };
@@ -636,7 +636,7 @@ fn known_view(start: usize) -> bool {
     if light() && PUBLISHED.all(first, first + 1) {
         return true;
     }
-    let g = guards();
+    let g = guards_read();
     g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
 }
 
@@ -709,7 +709,17 @@ fn view_known() -> bool {
     }
 }
 
-static GUARDS: Mutex<Guards> = Mutex::new(Guards {
+/// `VICTORY_PORT_GUARD`: 1 (only) lets the read-only lookups of the guards
+/// ([`guards_read`]) share a read lock, so the read-heavy asks of host
+/// copies do not block on the exclusive lock the title's write faults and
+/// our own writes take. Unset or `0` (the default) keeps every look
+/// exclusive, as before.
+fn port_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_GUARD").is_some_and(|v| v == "1"))
+}
+
+static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
@@ -719,14 +729,48 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holes: BTreeSet::new(),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+/// The guards' lock, alone: every mutation of the guards and every look
+/// that goes on to act on what it read takes it ([`guard_at`], [`open`],
+/// [`title_memory_written`], the write-fault handler). The same exclusive
+/// lock the `Mutex` gave, whatever `VICTORY_PORT_GUARD` says.
+fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
+    GUARDS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A read-only look at the guards ([`known_view`], [`clean`],
+/// [`unchanged_known`], the first look of [`look_at_holes`], the known
+/// check of [`guard_at`], diagnostics): a read lock with
+/// `VICTORY_PORT_GUARD=1`, the exclusive lock without it (as every look
+/// did before). The lock is let go at the end of the look; nothing acts
+/// on what it read under it.
+fn guards_read() -> GuardsRead<'static> {
+    if port_guard() {
+        GuardsRead::Read(GUARDS.read().unwrap_or_else(|e| e.into_inner()))
+    } else {
+        GuardsRead::Write(GUARDS.write().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+/// What [`guards_read`] returns: a shared or an exclusive guard.
+enum GuardsRead<'a> {
+    Read(std::sync::RwLockReadGuard<'a, Guards>),
+    Write(std::sync::RwLockWriteGuard<'a, Guards>),
+}
+
+impl std::ops::Deref for GuardsRead<'_> {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        match self {
+            GuardsRead::Read(g) => g,
+            GuardsRead::Write(g) => g,
+        }
+    }
 }
 
 /// Whether the block `page` is read-only by our hand and unwritten since a
 /// copy took it (diagnostics of `VICTORY_BACK_OWN_CHECK`).
 pub(crate) fn clean(page: usize) -> bool {
-    guards().clean.contains(&page)
+    guards_read().clean.contains(&page)
 }
 
 /// `VICTORY_LIGHT_REFRESH`: 0 off, 1 on, 2 in turn ([`light`]).
@@ -1074,7 +1118,7 @@ fn look_at_holes(most: usize) {
         return;
     };
     let part: Vec<usize> = {
-        let g = guards();
+        let g = guards_read();
         if g.holes.is_empty() {
             return;
         }
@@ -1195,7 +1239,7 @@ pub(crate) fn unchanged_known(start: usize, end: usize, base: usize, copied: &[u
     }
     // (The journal's lock is let go first: `writes_as` takes it, then the
     // guards'.)
-    let g = guards();
+    let g = guards_read();
     let blocks = last - first;
     g.protected.range(first..last).count() == blocks && g.clean.range(first..last).count() == blocks
 }
@@ -1320,7 +1364,7 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
+        let g = guards_read();
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
     };
