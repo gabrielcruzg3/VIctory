@@ -455,6 +455,10 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// The render target views and the depth view the host list has, once
+    /// it has any ([`State::set_targets`]): per view the host texture (0:
+    /// a null view) and what its descriptor says.
+    host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -716,6 +720,10 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// What a render target or depth view of the host is made from: the host
+/// texture, and [`crate::descriptor::RtvRecord::key`].
+type TargetKey = (usize, (usize, [u32; 7]));
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
@@ -742,9 +750,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.fill_scratch(address as *const u8, len)
 }
 
 macro_rules! once {
@@ -851,7 +857,8 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
-    /// Render targets and depth, set on the host list at once.
+    /// Render targets and depth, set on the host list at once, unless it has
+    /// the same ones already (`VICTORY_BIND_CACHE=0` sets them every time).
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         let Some(host) = crate::host::host() else {
             return;
@@ -861,7 +868,8 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut views = Vec::with_capacity(handles.len());
+        let mut keys = Vec::with_capacity(handles.len());
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -881,14 +889,16 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    views.push((None, Some(desc)));
+                    keys.push((0, record.key()));
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            views.push((Some(texture), record.desc()));
+            keys.push((texture.as_raw() as usize, record.key()));
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
@@ -901,8 +911,25 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some((texture, record))
         });
+        let now = (
+            keys,
+            dsv.as_ref()
+                .map(|(texture, record)| (texture.as_raw() as usize, record.key())),
+        );
+        static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *CACHE.get_or_init(|| std::env::var_os("VICTORY_BIND_CACHE").is_none_or(|v| v != "0"))
+            && self.host_targets.as_ref() == Some(&now)
+        {
+            return;
+        }
+        self.host_targets = Some(now);
+        let rtvs: Vec<_> = views
+            .iter()
+            .map(|(texture, desc)| host.rtv(*texture, desc.as_ref()))
+            .collect();
+        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -975,6 +1002,7 @@ impl State {
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
+        self.host_targets = None;
         if self.targets_set {
             let handles = std::mem::take(&mut self.target_handles);
             self.set_targets(list, &handles, self.depth_handle);
@@ -1254,10 +1282,8 @@ impl State {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -1701,53 +1727,77 @@ impl State {
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        let alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
-        for (n, &index) in slots.iter().enumerate() {
-            let Some(handle) = heap.handle(index) else {
-                ranges.remove(&index);
-                continue;
-            };
-            let Some((view, resolved)) = host.mirror_heap_buffer(index, handle) else {
-                ranges.remove(&index);
-                continue;
-            };
+        /// The title's heap, for the worker threads that inspect slots.
+        struct Shared<'a>(&'a crate::descriptor::Heap);
+        // SAFETY: `Heap` methods used here (`handle`) are thread-safe and `heap` outlives `each_view`.
+        unsafe impl Sync for Shared<'_> {}
+        impl Shared<'_> {
+            fn handle(&self, index: u32) -> Option<u64> {
+                self.0.handle(index)
+            }
+        }
+        let shared_heap = Shared(heap);
+        let look = |index: u32| -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+            let handle = shared_heap.handle(index)?;
+            let (view, resolved) = host.mirror_heap_buffer(index, handle)?;
             #[cfg(feature = "diagnostics")]
             let made = resolved.is_some();
-            if alive
-                && n % 64 == 63
-                && let Some(why) = crate::descriptor::host::device_removed()
-            {
-                alive = false;
-                GONE.store(true, Ordering::Relaxed);
-                let last: Vec<String> = slots[n - 63..=n]
-                    .iter()
-                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                    .map(|s| s.chars().take(200).collect())
-                    .collect();
-                tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
-                crate::host::log_removal_context();
-            }
-            let (shadow, address, len) = match resolved {
-                Some(copy) => copy,
-                None => match crate::descriptor::host::buffer_copy(&view) {
-                    Some(copy) => copy,
-                    None => {
-                        ranges.remove(&index);
-                        continue;
-                    }
-                },
-            };
+            let (shadow, address, len) = resolved.or_else(|| crate::descriptor::host::buffer_copy(&view))?;
             #[cfg(feature = "diagnostics")]
             if !made && host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            if let Some(entry) = ranges.get_mut(&index) {
-                if !(std::sync::Arc::ptr_eq(&entry.0, &shadow) && entry.1 == address && entry.2 == address + len) {
-                    *entry = (shadow, address, address + len);
+            Some((shadow, address, address + len))
+        };
+        const AT_A_TIME: usize = 256;
+        let parts: Vec<&[u32]> = slots.chunks(AT_A_TIME).collect();
+        let found: Vec<std::sync::OnceLock<Vec<(u32, Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>)>>> =
+            parts.iter().map(|_| Default::default()).collect();
+        crate::view_pool::each_view(parts.len(), &|n| {
+            let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
+            if alive
+                && let Some(why) = crate::descriptor::host::device_removed()
+                && !GONE.swap(true, Ordering::Relaxed)
+            {
+                let last: Vec<String> = parts[n]
+                    .iter()
+                    .filter_map(|&i| {
+                        crate::descriptor::view(shared_heap.handle(i)?)
+                            .map(|v| format!("{i}: {v:?}"))
+                    })
+                    .map(|s| s.chars().take(200).collect())
+                    .collect();
+                tracing::error!(
+                    why,
+                    "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}"
+                );
+                crate::host::log_removal_context();
+            }
+            let _ = found[n].set(looked);
+        });
+        for (index, entry) in found
+            .into_iter()
+            .filter_map(std::sync::OnceLock::into_inner)
+            .flatten()
+        {
+            match entry {
+                Some((shadow, from, to)) => {
+                    if let Some(existing) = ranges.get_mut(&index) {
+                        if !(std::sync::Arc::ptr_eq(&existing.0, &shadow)
+                            && existing.1 == from
+                            && existing.2 == to)
+                        {
+                            *existing = (shadow, from, to);
+                        }
+                    } else {
+                        ranges.insert(index, (shadow, from, to));
+                    }
                 }
-            } else {
-                ranges.insert(index, (shadow, address, address + len));
+                None => {
+                    ranges.remove(&index);
+                }
             }
         }
         let views = ranges.len() as u32;
@@ -2059,7 +2109,10 @@ impl State {
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
         // The worker may run two passes in a frame: no shorter than that.
         let took = if matches!(into, Into::Ahead(_)) { took.max(100) } else { took };
-        let most = (4000 / took).clamp(16, 256);
+        let most = match look_ms() {
+            Some(ms) => (ms / frame_ms(frame, now)).clamp(1, 256),
+            None => (4000 / took).clamp(16, 256),
+        };
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -3967,6 +4020,45 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
     }
+}
+
+/// The longest wait, in milliseconds, between two looks at a texture slot
+/// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`; unset: about
+/// four seconds counted in passes, as before). The looks back off 1, 2, 4,
+/// ... frames up to it.
+fn look_ms() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        let ms = std::env::var("VICTORY_TEXTURE_LOOK_MS")
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|&ms| ms > 0)?;
+        tracing::info!(
+            ms,
+            "texture slots waiting for their memory are looked at at least this often (VICTORY_TEXTURE_LOOK_MS)"
+        );
+        Some(ms)
+    })
+}
+
+/// The milliseconds of a frame lately (a mean over the last frames), from
+/// the pass's frame number and clock.
+fn frame_ms(frame: u64, now: u64) -> u64 {
+    use std::sync::Mutex;
+    static LAST: Mutex<(u64, u64, f64)> = Mutex::new((0, 0, 50.0));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let (was_frame, was_ms, mean) = *last;
+    if frame > was_frame {
+        if was_frame != 0 {
+            let each = now.saturating_sub(was_ms) as f64 / (frame - was_frame) as f64;
+            last.2 = mean * 0.9 + each.clamp(1.0, 2000.0) * 0.1;
+        }
+        last.0 = frame;
+        last.1 = now;
+    }
+    (last.2 as u64).max(1)
 }
 
 #[cfg(test)]

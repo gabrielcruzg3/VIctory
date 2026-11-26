@@ -206,6 +206,7 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        due.clear();
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -218,13 +219,11 @@ pub(crate) fn sync_heaps() {
                 if crate::host::read_into(from as *const u8, slice) {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-                    // The page's records in one go, under one lock
-                    // (`HostHeap::mirror_copied_page`); one by one below
-                    // with `VICTORY_HEAP_SYNC_PAGE=0`.
+                    // Collect changed slots across all pages of the heap first,
+                    // then mirror in parallel across `view_pool` chunks; one by one
+                    // below with `VICTORY_HEAP_SYNC_PAGE=0`.
                     let slots = if page_at_once() {
-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, slice, &mut due);
-                        looked += seen;
-                        mirrored += made;
+                        looked += host.collect_copied_page(slots, (start, step), from, slice, &mut due);
                         0..0
                     } else {
                         slots
@@ -250,12 +249,24 @@ pub(crate) fn sync_heaps() {
                 page += crate::watch::PAGE;
             }
         }
+        if !due.is_empty() {
+            mirrored += due.len() as u64;
+            crate::view_pool::each_view(due.len().div_ceil(SYNC_AT_A_TIME), &|n| {
+                if let Some(chunk) = due.chunks(SYNC_AT_A_TIME).nth(n) {
+                    host.mirror_copied_chunk(chunk);
+                }
+            });
+        }
     }
     drop(heaps);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
     }
 }
+
+/// Records [`sync_heaps`] gives a thread at a time.
+#[cfg(windows)]
+const SYNC_AT_A_TIME: usize = 256;
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
@@ -356,6 +367,15 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// All the view it records is made from: records with equal keys have
+    /// equal views (of the same host texture).
+    #[cfg(windows)]
+    pub(crate) fn key(&self) -> (usize, [u32; 7]) {
+        let mut words = [self.described; 7];
+        words[1..].copy_from_slice(&self.desc);
+        (self.resource as usize, words)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
