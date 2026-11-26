@@ -1,5 +1,7 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! (host slots 0-3) and, in the slots XInput leaves empty, from HID
+//! ([`hid`]: DualShock 4, DualSense and generic HID gamepads); while none is
+//! connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -20,6 +22,8 @@ use std::time::{Duration, Instant};
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
+
+mod hid;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -637,7 +641,7 @@ fn relative(
     // SAFETY: a reading we handed out and the title still holds.
     let reference = unsafe { &*reference };
     // shortcut: with no device given only the reference's device is walked,
-    // not every device's readings in time order; the title walks
+    // not every device's readings in time order; Grand Theft Auto VI walks
     // only keyboard readings (one device) and the current pad's previous one.
     let Some(index) = hub.index(reference.device) else {
         return fail(out, E_INVALIDARG);
@@ -712,7 +716,7 @@ fn token(out: *mut u64) -> HRESULT {
     S_OK
 }
 
-// shortcut: reading callbacks never run; the title registers none
+// shortcut: reading callbacks never run; Grand Theft Auto VI registers none
 // (it polls).
 extern "system" fn register_reading(
     _: This,
@@ -911,7 +915,7 @@ extern "system" fn device_status(this: *const Device) -> u32 {
 // shortcut: trigger motors are dropped (XInput has none). The host API that
 // drives them without a redistributable is Windows.Gaming.Input (WinRT
 // `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; the title sends trigger levels in slot 0x50.
+// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
@@ -1130,10 +1134,14 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// Pads XInput does not list, and which of them sits in each slot
+        /// XInput leaves empty.
+        hid: super::hid::Pads,
+        hid_slots: [Option<u64>; PADS],
     }
 
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+    impl Host {
+        fn xinput(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1144,12 +1152,41 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
+            Some(convert(&state.Gamepad))
+        }
+
+        /// The HID pad in this slot: the one it had while that one is still
+        /// connected, else the oldest one in no slot yet.
+        fn hid(&mut self, slot: usize) -> Option<PadState> {
+            let connected = self.hid.connected();
+            let kept = self.hid_slots[slot].filter(|id| connected.iter().any(|(c, _)| c == id));
+            let id = kept.or_else(|| {
+                connected
+                    .iter()
+                    .map(|&(id, _)| id)
+                    .find(|id| !self.hid_slots.contains(&Some(*id)))
+            });
+            self.hid_slots[slot] = id;
+            connected.into_iter().find(|&(c, _)| Some(c) == id).map(|(_, pad)| pad)
+        }
+    }
+
+    impl Source for Host {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
             #[allow(unused_mut)]
-            let mut pad = convert(&state.Gamepad);
+            let mut pad = match self.xinput(slot) {
+                Some(pad) => {
+                    // An XInput pad takes the slot; a HID pad there moves
+                    // to a free one.
+                    self.hid_slots[slot] = None;
+                    pad
+                }
+                None => self.hid(slot)?,
+            };
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
-            // to the pad (the title's start screen) saw nothing.
+            // to the pad (Grand Theft Auto VI's start screen) saw nothing.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
@@ -1181,8 +1218,8 @@ mod host {
                     // SAFETY: plain query.
                     scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
                     virtual_key: vk,
-                    // shortcut: no characters (code point 0);
-                    // the title reads scan codes and virtual keys only.
+                    // shortcut: no characters (code point 0); Grand Theft
+                    // Auto VI reads scan codes and virtual keys only.
                     ..Default::default()
                 })
                 .collect()
@@ -1195,6 +1232,9 @@ mod host {
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+            if let Some(id) = self.hid_slots[slot] {
+                self.hid.rumble(id, low, high);
+            }
         }
     }
 

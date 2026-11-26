@@ -371,11 +371,98 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
+    if unsafe { null_copy(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // SAFETY: as above.
     if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
         // SAFETY: as above.
         unsafe { report("first-chance exception", info, false) };
     }
     EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Ported from `p1nkman-VI`: a copy the title asks of the C runtime from the
+/// null page, read as zeros. The title's script interpreter (return `+0x3de6491`
+/// in the retail image) copies a field of a struct whose pointer it got as
+/// nothing, in the boat mission, a few minutes in, on every fork; the process
+/// ended there. Only when every sign agrees: a read of the first 64 KiB, in
+/// `VCRUNTIME140`'s copy, from the source register, of at most a page, called
+/// from the title's image: the destination gets zeros and the call returns.
+/// `VICTORY_NULL_COPY=0` leaves it to end the process as before. The first
+/// few, and then one in a thousand, are logged with what the script had at hand.
+///
+/// # Safety
+/// `info` comes from the system, for an exception being dispatched.
+unsafe fn null_copy(info: *mut EXCEPTION_POINTERS) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_NULL_COPY").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    // SAFETY: the system passes valid exception pointers.
+    let (record, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+    if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 {
+        return false;
+    }
+    let (write, at) = (record.ExceptionInformation[0], record.ExceptionInformation[1]);
+    let (src, len, dst) = (context.Rdx as usize, context.R8 as usize, context.Rcx as usize);
+    if write != 0 || at >= 0x1_0000 || !(src <= at && at < src.saturating_add(len.max(1))) || len > 4096 || dst < 0x1_0000 {
+        return false;
+    }
+    let in_module = |address: usize, name: &str| {
+        module_of(address).is_some_and(|m| m.to_ascii_lowercase().starts_with(name))
+    };
+    if !in_module(context.Rip as usize, "vcruntime140") {
+        return false;
+    }
+    let mut ret = [0u8; 8];
+    if !read_own(context.Rsp as usize, &mut ret) {
+        return false;
+    }
+    let ret = u64::from_le_bytes(ret);
+    // (the tests' own image stands in for the title's)
+    let title = if cfg!(test) { "victory_loader" } else { "victory-image" };
+    if !in_module(ret as usize, title) {
+        return false;
+    }
+    let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 3 || n % 1000 == 0 {
+        // What the script had at hand: its code around the byte pointer (rsi), the top of
+        // its stack (the stack pointer is held at r13) and the instruction's two operand
+        // bytes (the caller's rsp + 0x30).
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let mut code = [0u8; 48];
+        let code = read_own((context.Rsi as usize).wrapping_sub(32), &mut code).then(|| hex(&code));
+        let mut top = [0u8; 8];
+        let top = read_own(context.R13 as usize, &mut top).then(|| u64::from_le_bytes(top));
+        let mut stack = [0u8; 64];
+        let stack = top.filter(|t| *t > 64).and_then(|t| read_own(t as usize - 64, &mut stack).then(|| hex(&stack)));
+        let mut operands = [0u8; 2];
+        let operands = read_own(context.Rsp as usize + 8 + 0x30, &mut operands).then_some(operands);
+        eprintln!(
+            "victory-3060TI (null_copy): copy of {len} bytes from {at:#x} read as zeros (number {n}) for {}: rsi {:#x} code[-32..16] {code:?} stack top {top:?} stack[-64..0] {stack:?} operands {operands:?}",
+            locate(ret as usize),
+            context.Rsi
+        );
+    }
+    // SAFETY: the destination is the caller's, which it hands the copy to write.
+    unsafe { (dst as *mut u8).write_bytes(0, len) };
+    context.Rax = dst as u64;
+    context.Rip = ret;
+    context.Rsp += 8;
+    true
+}
+
+/// Reads `out.len()` bytes of this process at `at`, false if they are not all readable.
+fn read_own(at: usize, out: &mut [u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut read = 0usize;
+    // SAFETY: the system checks the source range; `out` is ours.
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), at as *const _, out.as_mut_ptr().cast(), out.len(), &mut read) };
+    ok != 0 && read == out.len()
 }
 
 /// For an unhandled-exception filter: reports the exception that is about
@@ -725,6 +812,62 @@ mod tests {
     /// On an Intel CPU, the real instructions go through the vectored
     /// handler. On an AMD CPU they run natively, and the tests below test
     /// the emulation.
+    /// The boat mission's fault as the log has it (a 16-byte copy from 0 in the C runtime's
+    /// copy, called from the title's image) goes on with zeros at the destination, returned
+    /// from; one from elsewhere, or of a nonzero address, is left alone.
+    #[test]
+    fn a_null_copy_from_the_title_reads_zeros_and_returns() {
+        use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+        use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, EXCEPTION_POINTERS, EXCEPTION_RECORD};
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups of a loaded module and one of its exports.
+        let memcpy = unsafe {
+            let m = GetModuleHandleA(c"vcruntime140.dll".as_ptr().cast());
+            assert!(!m.is_null(), "vcruntime140 is loaded");
+            GetProcAddress(m, c"memcpy".as_ptr().cast()).unwrap() as usize
+        };
+        let ret = a_null_copy_from_the_title_reads_zeros_and_returns as *const () as usize + 4;
+        let mut dst = [0xaau8; 16];
+        let mut stack = [ret as u64, 0];
+        let run = |rip: usize, at: usize, ret_slot: &mut [u64; 2], dst: &mut [u8; 16]| {
+            // SAFETY: zeroed system structures are valid.
+            let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+            record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+            record.NumberParameters = 2;
+            record.ExceptionInformation[1] = at;
+            // SAFETY: as above.
+            let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+            context.Rip = rip as u64;
+            context.Rsp = ret_slot.as_ptr() as u64;
+            context.Rcx = dst.as_mut_ptr() as u64;
+            context.Rdx = at as u64;
+            context.R8 = 16;
+            let mut info = EXCEPTION_POINTERS { ExceptionRecord: &mut record, ContextRecord: &mut context };
+            // SAFETY: the structures above, the destination ours.
+            let handled = unsafe { super::null_copy(&mut info) };
+            (handled, context)
+        };
+        let (handled, context) = run(memcpy, 0, &mut stack, &mut dst);
+        assert!(handled);
+        assert_eq!(dst, [0; 16]);
+        assert_eq!((context.Rip, context.Rax), (ret as u64, dst.as_ptr() as u64));
+        assert_eq!(context.Rsp, stack.as_ptr() as u64 + 8);
+        let mut other = [0xaau8; 16];
+        assert!(!run(memcpy, 0x2_0000, &mut stack, &mut other).0, "not the null page");
+        assert!(!run(ret, 0, &mut stack, &mut other).0, "not in the C runtime");
+        assert_eq!(other, [0xaa; 16]);
+    }
+
+    #[test]
+    fn own_memory_is_read_only_where_it_is_readable() {
+        let data = [1u8, 2, 3, 4];
+        let mut out = [0u8; 4];
+        assert!(super::read_own(data.as_ptr() as usize, &mut out));
+        assert_eq!(out, data);
+        assert!(!super::read_own(0, &mut out), "the null page is not readable");
+        assert!(!super::read_own(16, &mut out));
+    }
+
     #[test]
     fn clwb_loops() {
         // clwb [rcx]; add rcx, 0x40; cmp rcx, rax; jbe top
