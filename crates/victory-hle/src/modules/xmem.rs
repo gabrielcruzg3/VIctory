@@ -160,8 +160,9 @@ pub extern "system" fn XMemVirtualAlloc(
     if at.is_null() && constrained && highest < FOUR_GIB {
         at = low_guards::retry(size, || allocate(&mut parameter));
     }
+    // Memory committed for the title: clear uncommitted-block notes (`VICTORY_ABSENT_ONCE`).
     if !at.is_null() && kind & MEM_COMMIT != 0 {
-        victory_gpu::title_pages_changed(at as usize, size);
+        victory_gpu::title_memory_committed(at as usize, size);
     }
     if base.is_null() {
         // The census keeps what the title asked for (`VICTORY_CENSUS`).
@@ -1483,8 +1484,9 @@ extern "system" fn title_virtual_alloc(
 ) -> *mut c_void {
     // SAFETY: the title's own arguments, passed through.
     let at = unsafe { VirtualAlloc(base, size, kind, protect) };
+    // Memory committed for the title: clear uncommitted-block notes (`VICTORY_ABSENT_ONCE`).
     if !at.is_null() && kind & MEM_COMMIT != 0 {
-        victory_gpu::title_pages_changed(at as usize, size);
+        victory_gpu::title_memory_committed(at as usize, size);
     }
     at
 }
