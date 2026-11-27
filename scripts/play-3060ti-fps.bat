@@ -16,7 +16,6 @@ if /i "%~1"=="warn" set "VICTORY_LOG=warn,victory_gpu::host=info,victory_gpu::te
 if /i "%~1"=="meter" (
     set "VICTORY_LOG=error,victory_gpu::host=info,victory_gpu::cardmeter=info,victory_gpu::framelog=info"
     set "VICTORY_CARD_METER=1"
-    set "VICTORY_CARD_METER_PIPELINES=1"
 )
 if /i "%~1"=="warmup" goto warmup
 
