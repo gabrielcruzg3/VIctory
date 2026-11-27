@@ -62,6 +62,8 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
+mod launch;
+#[cfg(windows)]
 mod port;
 pub mod list;
 pub mod object;
