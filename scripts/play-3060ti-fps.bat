@@ -14,8 +14,9 @@ set "VICTORY_DATA_DIR=%WORK_DIR%\data"
 set "VICTORY_LOG=error,victory_gpu::host=info"
 if /i "%~1"=="warn" set "VICTORY_LOG=warn,victory_gpu::host=info,victory_gpu::texback=info,victory_gpu::ambient=info"
 if /i "%~1"=="meter" (
-    set "VICTORY_LOG=error,victory_gpu::host=info,victory_gpu::cardmeter=info,victory_gpu::framelog=info"
+    set "VICTORY_LOG=error,victory_gpu::host=info,victory_gpu::cardmeter=info,victory_gpu::framelog=info,victory_gpu::launch=info"
     set "VICTORY_CARD_METER=1"
+    set "VICTORY_FRAME_LOG=1"
 )
 if /i "%~1"=="warmup" goto warmup
 
