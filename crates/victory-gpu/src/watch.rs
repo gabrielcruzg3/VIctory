@@ -739,12 +739,22 @@ fn view_known() -> bool {
     }
 }
 
+#[cfg(test)]
+pub(crate) static PORT_GUARD_TEST: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 /// `VICTORY_PORT_GUARD`: 1 (only) lets the read-only lookups of the guards
 /// ([`guards_read`]) share a read lock, so the read-heavy asks of host
 /// copies do not block on the exclusive lock the title's write faults and
 /// our own writes take. Unset or `0` (the default) keeps every look
 /// exclusive, as before.
-fn port_guard() -> bool {
+pub(crate) fn port_guard() -> bool {
+    #[cfg(test)]
+    match PORT_GUARD_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_GUARD").is_some_and(|v| v == "1"))
 }
@@ -1499,17 +1509,30 @@ fn guard_at_later(
     // pages: 0.6 ms for the title's 174 MB heap, 16 times a frame, and most
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
+    let ask = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
+    let known = if ask {
+        false
+    } else {
         let g = guards_read();
-        let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+        let is_known = g.protected.contains(&first)
+            || g.absent.contains(&first)
+            || (view_known() && g.viewed.contains(&first));
+        if is_known
+            && port_guard()
+            && first < last
+            && g.arming.range(first..last).next().is_none()
+            && g.clean.range(first..last).count() == last - first
+        {
+            return Some((Vec::new(), Arming(Vec::new())));
+        }
+        is_known
     };
     if !known && !is_view(start, end) {
         return None;
     }
     install();
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let mut g = guards();
     // Blocks of the range another asking is making read-only outside the
     // lock ([`Arming`]): noted clean, and perhaps writable still. Read now
@@ -2073,7 +2096,21 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    let end = at.saturating_add(len);
+    if port_guard() {
+        let needs_open = at < end && {
+            let range = at / BLOCK..end.div_ceil(BLOCK);
+            let g = guards_read();
+            g.protected.range(range.clone()).next().is_some()
+                || g.arming.range(range.clone()).next().is_some()
+                || g.aliased.range(range).next().is_some()
+        };
+        if needs_open {
+            open(&mut guards(), at, end);
+        }
+    } else {
+        open(&mut guards(), at, end);
+    }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -2140,7 +2177,27 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
             return;
         }
     }
-    {
+    if port_guard() {
+        let range = at / BLOCK..end.div_ceil(BLOCK);
+        let guarded = {
+            let g = guards_read();
+            g.protected.range(range.clone()).count() as u64
+        };
+        if guarded == 0 || mode & 1 == 0 {
+            if pages && guarded != 0 {
+                WRITTEN[2].fetch_add(guarded, Relaxed);
+            }
+        } else {
+            let mut g = guards();
+            let guarded = g.protected.range(range).count() as u64;
+            if pages {
+                WRITTEN[2].fetch_add(guarded, Relaxed);
+            }
+            if guarded != 0 {
+                open(&mut g, at, end);
+            }
+        }
+    } else {
         let mut g = guards();
         let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
         if pages {
@@ -2275,11 +2332,20 @@ pub fn title_memory_committed(at: usize, len: usize) {
     if len == 0 || absent_mode() == 0 {
         return;
     }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if port_guard() {
+        let has_verified = {
+            let g = guards_read();
+            !g.verified.is_empty() && g.verified.range(first..last).next().is_some()
+        };
+        if !has_verified {
+            return;
+        }
+    }
     let mut g = guards();
     if g.verified.is_empty() {
         return;
     }
-    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let noted: Vec<usize> = g.verified.range(first..last).map(|(&block, _)| block).collect();
     for block in noted {
         g.verified.remove(&block);
@@ -3322,6 +3388,79 @@ pub(crate) mod tests {
         BITS.set(1 << 40);
         BITS.clear(1 << 40);
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+
+    struct PortGuardReset(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Drop for PortGuardReset {
+        fn drop(&mut self) {
+            PORT_GUARD_TEST.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn with_port_guard(on: bool) -> PortGuardReset {
+        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        PORT_GUARD_TEST.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+        PortGuardReset(turn)
+    }
+
+    #[test]
+    fn port_guard_shares_read_locks_and_defaults_exclusive() {
+        // Enabled (`VICTORY_PORT_GUARD=1`): `guards_read` takes a shared read lock.
+        {
+            let _mode = with_port_guard(true);
+            assert!(port_guard());
+            let shared_ok = (0..32).any(|_| {
+                let r1 = guards_read();
+                assert!(matches!(r1, GuardsRead::Read(_)));
+                assert!(GUARDS.try_write().is_err());
+                // Another parallel test queuing a write lock causes Windows SRWLOCK
+                // `try_read()` to yield `WouldBlock`; dropping `r1` between tries drains it.
+                let ok = std::thread::scope(|s| s.spawn(|| GUARDS.try_read().is_ok()).join().unwrap());
+                if !ok {
+                    drop(r1);
+                    std::thread::yield_now();
+                }
+                ok
+            });
+            assert!(shared_ok, "another thread can acquire a shared read lock concurrently");
+        }
+        // Disabled (default / `0`): `guards_read` keeps an exclusive write lock.
+        {
+            let _mode = with_port_guard(false);
+            assert!(!port_guard());
+            let w1 = guards_read();
+            assert!(matches!(w1, GuardsRead::Write(_)));
+            assert!(GUARDS.try_read().is_err(), "exclusive lock must block shared readers");
+        }
+    }
+
+    #[test]
+    fn port_guard_read_fast_paths_preserve_guard_semantics() {
+        let _mode = with_port_guard(true);
+        const SIZE: usize = 2 * BLOCK;
+        let (section, guarded, other) = two_views(SIZE);
+        let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
+        let mut unguarded = [0u8; 64];
+        let unguarded_at = unguarded.as_mut_ptr() as usize;
+        // First pass arms the view under the write lock.
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
+        // Clean pass hits the `guards_read()` fast path with no writes reported.
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        // `title_memory_written` and `writing` on an unguarded address skip write locks cleanly.
+        title_memory_written(unguarded_at, unguarded.len(), true);
+        writing(unguarded_at, unguarded.len());
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        // `writing` on an aliased view block still opens the guarded block.
+        writing(other + BLOCK, BLOCK);
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        // `title_memory_written` on a guarded block with `pages = true` opens it as before.
+        title_memory_written(guarded, BLOCK, true);
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0)]));
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        drop_views(section, &[guarded, other], SIZE);
     }
 }
 

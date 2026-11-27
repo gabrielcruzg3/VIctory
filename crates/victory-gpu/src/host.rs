@@ -594,6 +594,9 @@ pub(crate) fn host() -> Option<&'static Host> {
 fn create() -> windows::core::Result<Host> {
     crate::drvwatch::start();
     crate::spread::start();
+    if crate::watch::port_guard() {
+        tracing::info!("guard lookups share a read lock (VICTORY_PORT_GUARD=1)");
+    }
     // Diagnostics: RenderDoc, if asked for, before any graphics interface
     // is made (`VICTORY_RENDERDOC`).
     #[cfg(feature = "diagnostics")]

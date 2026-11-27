@@ -1,7 +1,7 @@
 @echo off
 setlocal
 rem victory-3060TI — Playable FPS-maxing preset (default, FPS > quality)
-rem Usage: play-3060ti-fps.bat [warmup | warn]
+rem Usage: play-3060ti-fps.bat [warmup | warn | meter]
 
 set "REPO=%~dp0.."
 set "EXE=%REPO%\target\release\victory.exe"
@@ -13,6 +13,11 @@ set "VICTORY_CACHE_DIR=%WORK_DIR%\cache"
 set "VICTORY_DATA_DIR=%WORK_DIR%\data"
 set "VICTORY_LOG=error,victory_gpu::host=info"
 if /i "%~1"=="warn" set "VICTORY_LOG=warn,victory_gpu::host=info,victory_gpu::texback=info,victory_gpu::ambient=info"
+if /i "%~1"=="meter" (
+    set "VICTORY_LOG=error,victory_gpu::host=info,victory_gpu::cardmeter=info,victory_gpu::framelog=info"
+    set "VICTORY_CARD_METER=1"
+    set "VICTORY_CARD_METER_PIPELINES=1"
+)
 if /i "%~1"=="warmup" goto warmup
 
 set "CONSOLE=series-s"
@@ -53,6 +58,7 @@ set "VICTORY_COPY_CHANGED=1"
 set "VICTORY_CLAMP_WAITS=0"
 set "VICTORY_WIDE_MERGE=1"
 set "VICTORY_RELAY_OWN_QUEUE=1"
+set "VICTORY_PORT_GUARD=1"
 
 if not exist "%EXE%" (echo Binary not found: %EXE% & echo Run cargo build --release first. & pause & exit /b 1)
 if not exist "%GAME_DIR%\game_scarlett_master.exe" (echo Game not found in %GAME_DIR%. Set GAME_DIR= first. & pause & exit /b 1)
