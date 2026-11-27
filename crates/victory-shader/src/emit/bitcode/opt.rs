@@ -52,10 +52,14 @@ pub const LOADS: u32 = 16;
 /// half has a lane where every lane is in EXEC (`lower.rs`,
 /// `v_readfirstlane_b32`).
 pub const FIRST: u32 = 32;
+/// Buffer loads of two to four dwords are emitted as one wide
+/// `rawBufferLoad` (guarded by `getDimensions` on bounded views) instead
+/// of one call per dword.
+pub const WIDE: u32 = 64;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
-pub const ALL: u32 = MODULE | FIRST;
+pub const ALL: u32 = MODULE | FIRST | WIDE;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").

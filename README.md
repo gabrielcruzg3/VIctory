@@ -19,8 +19,9 @@ All credit for the core compatibility layer and key components belongs to:
 ## What `victory-3060TI` Adds
 
 - **100% English codebase & launchers** with clean upstream-mergeable git history.
-- **GPU Mesh Launch (Wave 3B):**
-  - Amplification-shader indirect mesh launch (`VICTORY_MESH_LAUNCH`, on by default; `0` off) places a lightweight host amplification stage (`launch.hlsl` / `launch_code.rs`) in front of mesh shaders to read, clamp, and budget-charge indirect mesh records directly on the GPU without per-draw compute clamp dispatches or pipeline flushes (`launch.rs`, `pipeline/host.rs`, `draw.rs`, `emit/shader.rs`).
+- **GPU Mesh Launch & Safe Wave32 Shader Ops (Wave 3B/3C):**
+  - Amplification-shader indirect mesh launch (`VICTORY_MESH_LAUNCH`, on by default; `0` off) places a lightweight host amplification stage (`launch.hlsl` / `launch_code.rs`) in front of mesh shaders to read, clamp, and budget-charge indirect mesh records directly on the GPU without per-draw compute clamp dispatches or pipeline flushes (`launch.rs`, `pipeline/host.rs`, `draw.rs`, `emit/shader.rs`, `emit/container.rs`).
+  - Guarded 128-bit wide raw loads (`opt::WIDE = 64`, on by default with `getDimensions` bounds checks on bounded heap views), native Wave32 `ds_bpermute_b32` within 32-lane halves (after Belobug #363), and native DXIL pixel/mesh `quadReadLaneAt`/`quadOp` quad reads preserving helper lanes (after Belobug `03629f3f`) (`bitcode/opt.rs`, `lower.rs`).
 - **CPU / Heap-buffer & write-watch optimizations:**
   - Parallel descriptor mirroring & lock-free `Made` hit path (`VICTORY_VIEW_THREADS=8`): shards `HostHeap::made` across 512 bucket locks + atomic keys (`Made`) and parallelizes `sync_heaps` and `heap_buffers` across `view_pool` worker threads (`view_pool.rs`, `descriptor/host.rs`, `descriptor.rs`, `draw.rs`).
   - Draw-recording deduplication & faster streamed-texture sharpening: skips redundant `OMSetRenderTargets` (`VICTORY_BIND_CACHE`), deduplicates PSO/root-signature binds (`HostList::bind_pipeline`) and unaligned root CBV scratch fills (`HostList::fill_scratch`), and caps streamed-texture retry backoff by wall-clock ms (`VICTORY_TEXTURE_LOOK_MS=500`) (`descriptor.rs`, `draw.rs`, `host.rs`).

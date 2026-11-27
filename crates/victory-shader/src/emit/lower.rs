@@ -839,6 +839,26 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_WAVE3C=1`: the safe wave operations of Wave 3C, off by
+/// default. A `dwordx2/3/4` from a buffer is one raw load with that many
+/// components, not one per dword ([`Lower::flat`]); and the quad swizzles
+/// whose lanes swap along X, Y or the diagonal read through the native
+/// DXIL quad operation, not four lane reads and selects ([`Lower::quad_swap`]).
+fn wave3c() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_WAVE3C.with(|c| c.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE3C").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`wave3c`], for its thread only.
+    pub(super) static TEST_WAVE3C: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// The refusal of a first half of an interpolation whose result is read
 /// as data ([`Lower::interp`]).
 pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
@@ -1158,7 +1178,7 @@ impl<'a> Lower<'a> {
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
-                        || n.starts_with("ds_bpermute")
+                        // `ds_bpermute` reads within its own 32-lane half (Belobug #363).
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
@@ -1218,8 +1238,8 @@ impl<'a> Lower<'a> {
                             "v_readlane"
                         } else if n == "v_writelane_b32" {
                             "v_writelane"
-                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
-                            "ds_(b)permute"
+                        } else if n.starts_with("ds_permute") {
+                            "ds_permute"
                         } else if reads_mask_as_data(x.st, i) {
                             "mask as data"
                         } else {
@@ -1632,6 +1652,12 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        if let (None, Some(h), true) = (sub, h, n > 1 && Self::wide_loads()) {
+            for (k, x) in self.raw_dwords(h, off, n, false).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         for k in 0..n {
             let x = match sub {
                 None => {
@@ -4411,6 +4437,57 @@ impl<'a> Lower<'a> {
         r
     }
 
+    /// A quad swizzle that is a single read of the hardware quad, for the
+    /// three patterns that are one: `0xB1` swaps the lanes of each pair
+    /// along X, `0x4E` the pairs along Y, and `0x1B` reads the diagonal.
+    /// One native DXIL quad operation (`QuadOp`), where [`quad_pick`]
+    /// reads four lanes and selects.
+    fn quad_swap(&mut self, x: V, pattern: u32) -> V {
+        self.s.flags |= flags::WAVE_OPS;
+        let op = match pattern {
+            0xB1 => 0u8,
+            0x4E => 1,
+            _ => 2,
+        };
+        let c = self.cur;
+        let k = self.s.m.i8(op);
+        self.s.op(c, "quadOp.i32", Attr::NoUnwind, self.s.t.i32, 123, &[x, k])
+    }
+
+    /// `x` of lane `src` of this lane's quad, where lane `q` of each quad
+    /// reads lane `pattern[q]` of it (`src` is that lane's index in the
+    /// wave), for a quad-local swizzle or DPP `quad_perm`: in a pixel
+    /// shader and in a mesh shader through quad reads, else through a wave
+    /// read. Quad reads see helper lanes in pixel shaders (Belobug
+    /// 03629f3f), and broadcasts or X/Y/diagonal swaps take one native
+    /// quad operation.
+    fn quad_read(&mut self, x: V, src: V, pattern: [u32; 4]) -> V {
+        let quads = self.s.mesh.is_some() || self.s.pixel;
+        if !quads {
+            return self.read_lane(x, src);
+        }
+        let p = pattern.map(|k| k & 3);
+        if p == [0, 1, 2, 3] {
+            return x;
+        }
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        if p.iter().all(|&k| k == p[0]) {
+            self.s.flags |= flags::WAVE_OPS;
+            let k = self.s.m.i32(p[0]);
+            return self.s.op(c, "quadReadLaneAt.i32", Attr::NoUnwind, i32t, 122, &[x, k]);
+        }
+        // QuadOpKind: 0 across x (lane ^ 1), 1 across y (^ 2), 2 diagonal (^ 3).
+        for (kind, flip) in [(0u8, 1u32), (1, 2), (2, 3)] {
+            if (0..4).all(|q| p[q as usize] == q ^ flip) {
+                self.s.flags |= flags::WAVE_OPS;
+                let k = self.s.m.i8(kind);
+                return self.s.op(c, "quadOp.i32", Attr::NoUnwind, i32t, 123, &[x, k]);
+            }
+        }
+        self.quad_pick(x, src)
+    }
+
     /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
     /// lane: the console reads the first lane of EXEC, and a lane that got here with EXEC clear
     /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
@@ -4511,6 +4588,25 @@ impl<'a> Lower<'a> {
             }
             // The source sits in the address field.
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
+            // `VICTORY_WAVE3C=1`: a bit-15 swizzle that is identity or a
+            // whole-quad X, Y or diagonal swap needs no lane arithmetic:
+            // the latter three are one native quad read.
+            if offset & 0x8000 != 0 && wave3c() {
+                match offset & 0xFF {
+                    0xE4 => {
+                        let reg = dst_reg.ok_or("a swizzle result")?;
+                        self.write(inst, Reg::V(reg), x, guard);
+                        return Ok(());
+                    }
+                    0xB1 | 0x4E | 0x1B => {
+                        let r = self.quad_swap(x, offset & 0xFF);
+                        let reg = dst_reg.ok_or("a swizzle result")?;
+                        self.write(inst, Reg::V(reg), r, guard);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
             let lane = self.lane_index();
             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
             let src = if offset & 0x8000 != 0 {
@@ -4531,8 +4627,15 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
-                self.quad_pick(x, src)
+            let r = if quad {
+                // lane q of a quad reads lane pattern[q] of it
+                let pattern = if offset & 0x8000 != 0 {
+                    [0, 1, 2, 3].map(|q| offset >> (2 * q) & 3)
+                } else {
+                    let (and, or, xor) = (offset & 0x1F, offset >> 5 & 0x1F, offset >> 10 & 0x1F);
+                    [0, 1, 2, 3].map(|q| ((q & and) | or) ^ xor)
+                };
+                self.quad_read(x, src, pattern)
             } else {
                 self.read_lane(x, src)
             };
@@ -4542,28 +4645,30 @@ impl<'a> Lower<'a> {
         }
         if name == "ds_bpermute_b32" {
             // Backward permute: no LDS is touched. Each lane takes the data
-            // register of the lane its address names, (address + offset) / 4
-            // within the wave; a source lane outside EXEC gives 0. (
-            // the title's checkerboard shadow-mask generators read their
-            // neighbours' samples with it; without them every shadowed light
-            // was multiplied by an empty mask.)
+            // register of the lane its address names, (address + offset) / 4,
+            // within its own 32-lane half (from Belobug PR #363): in the same
+            // host wave on a 32-lane host too, where each host wave is one
+            // half of the console's. A source lane outside EXEC gives 0.
             // shortcut: a source lane that is not at this instruction on the
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
-            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
-            let src = self.s.m.bin(c, Bin::And, src, last);
+            let k31 = self.s.m.i32(31);
+            let mut src = self.s.m.bin(c, Bin::And, src, k31);
+            if self.wave() == 64 {
+                // The lane's own half: bit 5 of its host lane, which is 0 in
+                // a host wave of 32 (one half of the console's wave).
+                let lane = self.lane_index();
+                let k32 = self.s.m.i32(32);
+                let half = self.s.m.bin(c, Bin::And, lane, k32);
+                src = self.s.m.bin(c, Bin::Or, src, half);
+            }
             let x = match guard {
                 Some(g) => {
                     let z = self.s.m.i32(0);
@@ -5744,6 +5849,76 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether the dwords of one console load are read by one call for up
+    /// to four of them (`bitcode::opt::WIDE` of `VICTORY_SHADER_OPT`), not
+    /// by a call each.
+    fn wide_loads() -> bool {
+        super::shader_opt() & super::bitcode::opt::WIDE != 0
+    }
+
+    /// `count` dwords from byte `addr` on of the raw view `h`, as integers,
+    /// read by one call for every four of them ([`Self::wide_loads`]).
+    ///
+    /// `bounded`: `h` is a view from the heap, which the host bounds-checks
+    /// (a root view read by address has no bounds and needs no check). A
+    /// call of two to four dwords on a bounded view runs only where all of
+    /// them lie inside the view's bytes (`getDimensions`, the width in
+    /// bytes of a raw view); elsewhere the dwords are read by a call each.
+    fn raw_dwords(&mut self, h: V, addr: V, count: u32, bounded: bool) -> Vec<V> {
+        let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let size = (bounded && count > 1).then(|| {
+            let c = self.cur;
+            let i32t = self.s.t.i32;
+            let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+            let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, u]);
+            self.s.m.extract(c, d, 0)
+        });
+        let mut out = Vec::with_capacity(count as usize);
+        for first in (0..count).step_by(4) {
+            let n = (count - first).min(4);
+            let c = self.cur;
+            let off = self.s.m.i32(4 * first);
+            let a = self.s.m.bin(c, Bin::Add, addr, off);
+            let call = |l: &mut Self, at: V, n: u32| -> Vec<V> {
+                let b = l.cur;
+                let mask = l.s.m.i8((1u8 << n) - 1);
+                let r = l.s.op(b, "rawBufferLoad.f32", Attr::ReadOnly, l.s.t.res_ret, 139, &[h, at, u, mask, al]);
+                (0..n)
+                    .map(|k| {
+                        let x = l.s.m.extract(b, r, k);
+                        l.as_int(x)
+                    })
+                    .collect()
+            };
+            let Some(size) = size.filter(|_| n > 1) else {
+                out.extend(call(self, a, n));
+                continue;
+            };
+            // Inside: a + 4n neither wraps nor passes the width.
+            let bytes = self.s.m.i32(4 * n);
+            let end = self.s.m.bin(c, Bin::Add, a, bytes);
+            let fits = self.s.m.cmp(c, pred::IULE, end, size);
+            let no_wrap = self.s.m.cmp(c, pred::IUGE, end, a);
+            let inside = self.s.m.bin(c, Bin::And, fits, no_wrap);
+            let yes = self.s.m.bool(true);
+            let outside = self.s.m.bin(c, Bin::Xor, inside, yes);
+            let zero = self.s.m.i32(0);
+            let at = self.begin_guarded(Some(inside));
+            let wide: Vec<(V, V)> = call(self, a, n).into_iter().map(|x| (x, zero)).collect();
+            let wide = self.end_guarded(at, &wide);
+            let at = self.begin_guarded(Some(outside));
+            let mut each = Vec::with_capacity(n as usize);
+            for (k, &w) in wide.iter().enumerate() {
+                let b = self.cur;
+                let four = self.s.m.i32(4 * k as u32);
+                let ak = self.s.m.bin(b, Bin::Add, a, four);
+                each.push((call(self, ak, 1)[0], w));
+            }
+            out.extend(self.end_guarded(at, &each));
+        }
+        out
+    }
+
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
             data,
@@ -5825,7 +6000,12 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
-            for k in 0..count {
+            let wide = Self::wide_loads();
+            if wide {
+                let dwords = self.raw_dwords(h, addr, count, true);
+                raw.extend(dwords.into_iter().map(|x| (x, zero)));
+            }
+            for k in 0..if wide { 0 } else { count } {
                 let b = self.cur;
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(b, Bin::Add, addr, off);
@@ -5863,6 +6043,16 @@ impl<'a> Lower<'a> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
+            if Self::wide_loads() {
+                for (k, x) in self
+                    .raw_dwords(h, addr, count, !matches!(src, Source::Built { .. }))
+                    .into_iter()
+                    .enumerate()
+                {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -6610,6 +6800,25 @@ impl<'a> Lower<'a> {
         if !mesh_quad {
             self.cross_lane(quad)?;
         }
+        // `VICTORY_WAVE3C=1`: a full-quad permutation that swaps along X,
+        // Y or the diagonal is one native quad read (identity is the
+        // operand). Patterns with a row or bank mask take the general path.
+        if wave3c()
+            && let Dpp::Row {
+                ctrl,
+                row_mask: 0xF,
+                bank_mask: 0xF,
+                ..
+            } = dpp
+        {
+            let pattern = u32::from(ctrl);
+            if pattern == 0xE4 {
+                return Ok((x, None));
+            }
+            if matches!(pattern, 0xB1 | 0x4E | 0x1B) {
+                return Ok((self.quad_swap(x, pattern), None));
+            }
+        }
         let c = self.cur;
         let lane = self.lane_index();
         let k = |l: &mut Self, n: u32| l.s.m.i32(n);
@@ -6685,10 +6894,12 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
-            self.quad_pick(x, src)
-        } else {
-            self.read_lane(x, src)
+        let mut r = match dpp {
+            Dpp::Row { ctrl: ctrl @ 0..=0xFF, .. } => {
+                let ctrl = u32::from(ctrl);
+                self.quad_read(x, src, [0, 1, 2, 3].map(|q| ctrl >> (2 * q) & 3))
+            }
+            _ => self.read_lane(x, src),
         };
         let mut enable = None;
         if let Some(inside) = inside {
